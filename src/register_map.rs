@@ -4,8 +4,12 @@
 //! by functional block. The values match the register addresses
 //! defined in the datasheet.
 
+#[cfg(feature = "defmt")]
+use defmt::Format;
+
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
 pub enum Register {
     // ─────────────────────────────────────────────────────────────
     // Status Registers
@@ -105,7 +109,7 @@ pub enum Register {
     /// I2C Broadcast Address
     ///
     /// Address: 0x14
-    I2cBroadcastAddr = 0x14,
+    I2cBroadcast = 0x14,
 
     // ─────────────────────────────────────────────────────────────
     // PLL Configuration

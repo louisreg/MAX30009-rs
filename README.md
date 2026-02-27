@@ -1,288 +1,153 @@
-# MAX30009-rs
+# max30009-rs
 
-Rust driver for the **MAX30009 Analog Front-End**, with a strong focus on
-**correctness**, **datasheet fidelity**, and **zero-runtime-cost abstractions**.
+Rust `no_std` driver for the Maxim **MAX30009** bioimpedance AFE.
 
-This crate is designed for embedded / no_std environments and follows
-the MAX30009 datasheet *exactly*.
+The project is organized by register domain and stays close to the datasheet:
 
----
+- typed register encoders/decoders,
+- sparse read-modify-write updates,
+- high-level runtime helpers on `Max30009`.
 
-## PLL Configuration
+Datasheet used for this repository: [`max30009.pdf`](./max30009.pdf).
 
-This driver implements the **Timing Subsystem / PLL** of the MAX30009
-exactly as specified in the datasheet.
+## Warning
 
-It provides:
-- a safe, fluent Rust API
-- strict datasheet-compliant sequencing
-- frequency validation
-- optional PLL lock handling
-- support for internal and external reference clocks
-- BioZ-driven PLL synthesis (compile-time optimized)
+This driver is still **lightly tested** and should be considered **work in progress**.
+Use with caution for production or safety-critical usage until validation coverage is expanded.
 
----
+## Features
 
-### Example: Basic PLL Configuration
+- `no_std` friendly (`embedded-hal` v1 trait boundaries)
+- abstract bus interface via `RegisterInterface`
+- typed configs for:
+  - PLL (`pll`)
+  - BioZ path (`bioz`)
+  - FIFO (`fifo`)
+  - Interrupts (`interrupts`)
+  - Leads (`leads`)
+  - System (`system`)
+  - Status (`status`)
+- high-level sequencing helpers in `device::Max30009`:
+  - PLL lock flow
+  - shutdown enter/exit flow
+  - soft-reset flow
+  - BioZ startup/shutdown/standby
+  - FIFO control bits (`MARK`, `FLUSH`, `STAT_CLR`)
 
-```rust
-use max30009::pll::PllConfig;
-use max30009::registers::pll::{KDiv, NDiv};
+## Crate Layout
 
-let pll = PllConfig::new()
-    .internal_32k768()     // Internal 32.768 kHz reference clock
-    .mdiv(439)             // PLL ≈ 14.4 MHz
-    .ndiv(NDiv::Div512)    // BioZ ADC clock divider
-    .kdiv(KDiv::Div64)     // DDS synthesis divider
-    .lock_window_2clk()   // More tolerant lock detection
-    .enable();             // Enable PLL
+- `src/device.rs`: runtime driver helpers and register I/O glue.
+- `src/register_interface.rs`: hardware abstraction trait.
+- `src/register_map.rs`: register addresses.
+- `src/*/registers.rs`: typed raw register bitfields.
+- `src/*/config.rs`: high-level config payloads (apply/readback/update).
 
-pll.apply(&mut device)?;
-```
-
----
-
-## BioZ-driven PLL synthesis (recommended)
-
-Instead of manually selecting PLL dividers, the driver can **derive a valid PLL
-configuration directly from a target BioZ stimulus frequency**.
-
-This is the **recommended** way to configure the timing subsystem.
+## Quick Start
 
 ```rust
-use max30009::pll::{PllConfig, Policy};
+use max30009::{Max30009, PllFrequency, BiozConfig1};
 
-let mut pll = PllConfig::new()
-    .internal_32k768()
-    .lock_window_2clk()
-    .enable();
+fn configure<I: max30009::register_interface::RegisterInterface>(
+    dev: &mut Max30009<I>,
+) -> Result<(), I::Error> {
+    // Enable PLL bit (without changing other PLL_CONFIG1 fields)
+    dev.set_pll_enabled(true)?;
 
-let bioz = pll.from_f_bioz_nearest(
-    50_000,                // Target BioZ stimulus frequency (Hz)
-    Policy::MaxSNR,        // Optimization policy
-)?;
+    // Example sparse update
+    dev.update(PllFrequency {
+        enable: Some(true),
+        ..Default::default()
+    })?;
 
-// Configure BioZ using returned OSRs
-bioz_cfg
-    .adc_osr(bioz.adc_osr)
-    .dac_osr(bioz.dac_osr);
+    // Enable BioZ BG + I + Q
+    dev.update(BiozConfig1 {
+        bg_en: Some(true),
+        i_en: Some(true),
+        q_en: Some(true),
+        ..Default::default()
+    })?;
 
-pll.apply(&mut device)?;
+    Ok(())
+}
 ```
 
----
+## Sequence Helpers (Datasheet Oriented)
 
-### What does `from_f_bioz_nearest()` do?
+The following methods are available on `Max30009`:
 
-- Uses **precomputed compile-time tables**
-- Finds the **nearest achievable** BioZ frequency
-- Selects a **datasheet-valid** PLL configuration
-- Updates:
-  - `MDIV`
-  - `NDIV`
-  - `KDIV`
-- Returns:
-  - actual achievable `f_bioz`
-  - `BIOZ_ADC_OSR`
-  - `BIOZ_DAC_OSR`
-- **Does not touch hardware**
+### PLL
 
-Runtime complexity: **O(log N)**  
-Runtime allocations: **none**
+- `set_pll_enabled(enabled)`
+- `wait_for_pll_lock(delay, poll_interval_ms, max_attempts)`
+- `enable_pll_and_wait_lock(delay, poll_interval_ms, max_attempts)`
+- `disable_pll_sequence()`
+- `is_freq_locked()`
+- `is_pll_locked()`
+- `sync()` (`TIMING_SYS_RESET = 1`)
 
----
+### Shutdown
 
-## Synthesis policies
+- `enter_shutdown_sequence()`
+  - disable BioZ
+  - disable PLL
+  - set `SHDN = 1`
+- `exit_shutdown_sequence()`
+  - set `SHDN = 0`
+  - enable PLL
 
-The MAX30009 allows multiple valid configurations for the same BioZ frequency.
-This driver exposes **explicit policies** to choose between them.
+### Soft Reset
 
-### `Policy::MinLatency`
+- `soft_reset_sequence(delay)`
+  - `BIOZ_BG_EN = 1`
+  - `SHDN = 0`
+  - `REF_CLK_SEL = 0`
+  - `PLL_EN = 0`
+  - wait 1 ms
+  - `RESET = 1`
+  - `PLL_EN = 1`
 
-Optimized for:
-- lowest ADC oversampling
-- minimal group delay
-- behavior closest to the datasheet examples
+### BioZ
 
-Recommended when:
-- tight timing constraints
-- real-time feedback
-- minimal filtering latency
+- `bioz_startup(delay, enable_i, enable_q)`
+  - `BIOZ_BG_EN = 1`
+  - wait 200 ms
+  - enable I/Q as requested
+- `bioz_shutdown()` (`BIOZ_BG_EN`, `BIOZ_I_EN`, `BIOZ_Q_EN` -> `0`)
+- `bioz_standby(keep_rx_active)`
+  - `BIOZ_DRV_MODE = Standby`
+  - `BIOZ_STBYON = keep_rx_active`
 
----
+### FIFO
 
-### `Policy::MaxSNR` (default)
+- `set_fifo_mark()` (`FIFO_MARK = 1`)
+- `flush_fifo()` (`FLUSH_FIFO = 1`)
+- `clear_fifo_status()` (`FIFO_STAT_CLR = 1`)
 
-Optimized for:
-- higher ADC oversampling
-- longer integration
-- improved noise performance
+## Register Interface
 
-Recommended when:
-- BioZ precision matters
-
----
-
-## How is this implemented?
-
-At **build time**, the driver:
-
-1. Enumerates **all valid hardware combinations**:
-   - MDIV, NDIV, KDIV
-   - BIOZ_ADC_OSR, BIOZ_DAC_OSR
-2. Applies **all datasheet constraints**
-3. Enforces the BioZ integration rule:
-   ```
-   C_BIOZ = F_BIOZ / SR_BIOZ ∈ { 0.5, 1, 2, ... }
-   ```
-4. Builds **canonical lookup tables**:
-   - one table per reference clock
-   - one table per policy
-5. Embeds the tables as `static` data
-
-At runtime, only a **binary search** is performed.
-
----
-
-## What happens under the hood (PLL apply)
-
-When `apply()` is called, the driver follows the exact sequence
-recommended in the MAX30009 datasheet.
-
-### 1. Frequency validation
-
-The PLL output frequency is computed as:
-
-```
-PLL_CLK = REF_CLK × (MDIV + 1)
-```
-
-The driver verifies:
-
-```
-14 MHz ≤ PLL_CLK ≤ 28 MHz
-```
-
-If the frequency is out of range, the configuration is rejected
-**before any register is written**.
-
----
-
-### 2. Register programming (strict order)
-
-```
-PLL_CONFIG_1 (0x17)  → MDIV[9:8], NDIV, KDIV, PLL_EN
-PLL_CONFIG_2 (0x18)  → MDIV[7:0]
-PLL_CONFIG_3 (0x19)  → PLL lock detection window
-PLL_CONFIG_4 (0x1A)  → Reference clock selection
-```
-
----
-
-### 3. PLL settling delay
-
-```
-~6 ms
-```
-
-Allows bandgap + PLL to stabilize.
-
----
-
-### 4. PLL lock wait (optional)
-
-If `PLL_EN = 1`, the driver waits for the PLL to lock.
-
----
-
-## PLL timing overview
-
-```
-        REF_CLK (32.0 / 32.768 kHz)
-                 │
-                 ▼
-        ┌───────────────────┐
-        │       PLL         │
-        │  MDIV multiplier  │
-        │  (× (MDIV + 1))   │
-        └───────────────────┘
-                 │
-           PLL_CLK (14–28 MHz)
-                 │
-        ┌────────┴─────────┐
-        │                  │
-        ▼                  ▼
-   BioZ ADC CLK        DDS DAC CLK
-   (PLL_CLK / NDIV)   (PLL_CLK / KDIV)
-```
-
----
-
-## External reference clock
+Implement this trait for your SPI/I2C transport:
 
 ```rust
-.external_clock(ClockFreqSel::Khz32768)
+pub trait RegisterInterface {
+    type Error;
+    fn read_reg(&mut self, addr: u8) -> Result<u8, Self::Error>;
+    fn read_reg_burst(&mut self, addr: u8, buf: &mut [u8]) -> Result<(), Self::Error>;
+    fn write_reg(&mut self, addr: u8, value: u8) -> Result<(), Self::Error>;
+}
 ```
 
-⚠️ The selected frequency **must match** the clock on FCLK.
+## Build and Test
 
----
+This repo currently sets an embedded default target in `.cargo/config.toml`.
 
-## PLL Synchronization
+- library check (embedded target): `cargo check`
+- host-side tests (if needed): `cargo test --target x86_64-apple-darwin`
 
-The MAX30009 provides a hardware mechanism to synchronize the **PLL timing subsystems**
-of multiple AFEs so that all devices produce **time-aligned samples**.
+Adjust host target triple to your machine if you are not on macOS.
 
-The driver exposes this via the `PllSync` helper.
+## TODO
 
-### TRIG-based synchronization
-
-Controller:
-
-```rust
-let sync = PllSync::trig_controller();
-sync.synchronize(&mut device)?;
-```
-
-Target:
-
-```rust
-let sync = PllSync::trig_target();
-sync.synchronize(&mut device)?;
-```
-
----
-
-### Broadcast synchronization (I2C / SPI)
-
-```rust
-let sync = PllSync::broadcast();
-sync.synchronize(&mut device)?;
-```
-
----
-
-## Important notes
-
-- `PLL_EN` must be set before enabling BioZ
-- BioZ must be **disabled** during `TIMING_SYS_RESET`
-- All synchronized devices must:
-  - share the same reference clock
-  - have PLL enabled and locked
-- Synchronization does **not** configure the PLL itself
-
----
-
-## Datasheet reference
-
-MAX30009 Datasheet  
-Section: **Timing Subsystem / PLL**
-
-
-
-
-TODO:
-    PLL : powerup-down sequence pll: 
-Sequence of Operation When PLL is UsedWhen enabling or disabling PLL, the proper sequence of operations must be followed. This section describes therecommended sequence of operations for various scenarios when PLL is used.Enabling and Disabling the PLLThe following sequence is recommended when enabling and disabling the PLL.● Disable BioZ, if enabled.● Enable PLL by setting PLL_EN to 1.● Wait for PLL to lock using either the FREQ_LOCK[3](0x02) or PHASE_LOCK[2](0x02) status bits.● Enable BioZ I and Q, as needed.● Disable BioZ when data collection is done.● Disable PLL by setting PLL_EN to 0.Entering and Exiting ShutdownThe following sequence is recommended when putting the device into a shutdown state and to exit it.● Disable BioZ, if enabled.● Disable PLL by setting PLL_EN to 0, if enabled.● Set SHDN to 1, to enter the shutdown mode.● ...● Set SHDN to 0 to enter the normal mode.● Enable PLL by setting PLL_EN to 1.● Enable BioZ I and Q as needed.● ...Soft-Reset SequenceThe following sequence is required when resetting the device using the RESET bit. Failure to follow this sequence mayresult in registers becoming unresponsive until a power-on reset is performed.● Set BIOZ_BG_EN = 1.● Set SHDN = 0.● Set REF_CLK_SEL = 0.● Set PLL_EN = 0.● Wait for 1ms.● Set RESET = 1 to reset all registers.● Enable PLL by setting PLL_EN to 1.● ...
-
---> TimingSubsystem
+- Improve and extend test coverage (unit, integration, hardware-in-the-loop).
+- Add robust interrupt management flows (configuration, clear/ack strategy, runtime handling).
+- Provide ready-to-use SPI/I2C implementations of `RegisterInterface`.
+- Add a higher-level API layer for common end-to-end use cases and sequencing.

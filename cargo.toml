@@ -6,13 +6,38 @@ license = "MIT"
 description = "Embedded Rust driver for MAX30009 impedance measurement IC"
 repository = "https://github.com/louisreg/max30009-rs"
 
+# ---------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------
+
 [dependencies]
 embedded-hal = "1.0.0"
 bitflags = "2"
 thiserror = { version = "2.0.18", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+postcard-schema = { version = "0.2.2", default-features = false, features = ["derive"], optional = true }
+
+# Optional embedded logging (no_std)
+defmt = { version = "0.3", optional = true }
+libm = "0.2.16"
+
+# ---------------------------------------------------------------------
+# Dev dependencies (host tests / CI)
+# ---------------------------------------------------------------------
 
 [dev-dependencies]
 embedded-hal-mock = "0.11.1"
 
+# ---------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------
+
 [features]
+# Default = host-friendly (no defmt, std tests ok)
 default = []
+
+# Enable defmt logging + Format derives
+defmt = ["dep:defmt"]
+
+# Enable serde + postcard-schema derives for host/device RPC transport types.
+rpc-types = ["dep:serde", "dep:postcard-schema"]
